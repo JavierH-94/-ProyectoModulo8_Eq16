@@ -1,0 +1,1318 @@
+---
+title: "Análisis y Arquetipos de Pokémon"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: cosmo
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(scales)
+library(plotly)
+library(jsonlite)  # fromJSON(); solo se usa si hay que descargar de la API
+
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE
+)
+
+# Descarga desde PokéAPI -------------------------------------------------------
+
+# Una fila por especie. Se consultan dos endpoints porque /pokemon trae stats y
+# tipos, y /pokemon-species trae generación, legendario/mítico y preevolución.
+# La "/" final evita una redirección 301 en cada llamada.
+get_pokemon_data <- function(id) {
+  url_pokemon <- paste0("https://pokeapi.co/api/v2/pokemon/", id, "/")
+  url_especie <- paste0("https://pokeapi.co/api/v2/pokemon-species/", id, "/")
+
+  # Si un ID falla devuelve NULL; así una caída puntual no tira toda la descarga
+  tryCatch({
+    contenido <- fromJSON(url_pokemon)
+    especie   <- fromJSON(url_especie)
+
+    stats <- contenido$stats$base_stat
+    names(stats) <- contenido$stats$stat$name
+
+    tipos <- contenido$types$type$name
+    tipo_principal  <- str_to_title(tipos[1])
+    tipo_secundario <- str_to_title(tipos[2])  # NA en Pokémon de un solo tipo
+
+    # "generation-ii" -> "II"
+    generacion <- especie$generation$name
+    generacion <- str_remove(generacion, "generation-")
+    generacion <- str_to_upper(generacion)
+
+    # ID de la preevolución, tomado del final de su URL. NA si la especie no
+    # evoluciona de otra. Con esto se calcula después evolucion_final.
+    if (is.null(especie$evolves_from_species)) {
+      evoluciona_de <- NA_integer_
+    } else {
+      evoluciona_de <- as.integer(str_extract(especie$evolves_from_species$url, "\\d+(?=/$)"))
+    }
+
+    df <- tibble(
+      id = contenido$id,
+      name = str_to_title(contenido$name),
+      type_1 = tipo_principal,
+      type_2 = tipo_secundario,
+      generation = generacion,
+      hp = stats["hp"],
+      attack = stats["attack"],
+      defense = stats["defense"],
+      sp_atk = stats["special-attack"],
+      sp_def = stats["special-defense"],
+      speed = stats["speed"],
+      total = sum(stats),
+      legendary = especie$is_legendary,
+      mythical = especie$is_mythical,
+      evoluciona_de = evoluciona_de
+    )
+
+    Sys.sleep(0.1)  # para no saturar la API (son ~2,000 llamadas)
+
+    return(df)
+
+  }, error = function(e) {
+    # Se escribe a stderr porque message = FALSE oculta los message() al renderizar
+    cat("Error en ID", id, ":", conditionMessage(e), "\n", file = stderr())
+    return(NULL)
+  })
+}
+
+
+# Caché local ------------------------------------------------------------------
+
+# La descarga completa tarda varios minutos, así que solo se hace si no existe el CSV.
+archivo_csv <- "pokemon_gen_1_a_9"
+total_esperado <- 1025  # National Dex hasta Gen IX
+
+# Los IDs 1 a 1025 son la forma base de cada especie. Formas regionales,
+# Megaevoluciones y Gigamax tienen IDs desde 10001, así que quedan fuera.
+
+if (file.exists(archivo_csv)) {
+  pokemon_raw <- read_csv(archivo_csv, show_col_types = FALSE)
+} else {
+  pokemon_raw <- map_df(1:total_esperado, get_pokemon_data)
+
+  # Hasta 3 reintentos solo con los IDs que fallaron (suelen ser timeouts)
+  for (intento in 1:3) {
+    faltantes <- setdiff(1:total_esperado, pokemon_raw$id)
+    if (length(faltantes) == 0) break
+    cat("Reintento", intento, "- faltan", length(faltantes), "Pokémon\n", file = stderr())
+    Sys.sleep(5)
+    pokemon_raw <- bind_rows(pokemon_raw, map_df(faltantes, get_pokemon_data))
+  }
+  pokemon_raw <- arrange(pokemon_raw, id)
+
+  # Solo se guarda si la descarga está completa, para no cachear datos parciales
+  if (nrow(pokemon_raw) == total_esperado) {
+    write_csv(pokemon_raw, archivo_csv)
+    cat("CSV guardado en:", normalizePath(archivo_csv), "\n", file = stderr())
+  } else {
+    faltantes <- setdiff(1:total_esperado, pokemon_raw$id)
+    cat("Descarga incompleta. Faltan IDs:", paste(faltantes, collapse = ", "),
+        "\nNo se guardó el CSV.\n", file = stderr())
+  }
+}
+
+# Limpieza ---------------------------------------------------------------------
+
+pokemon <- pokemon_raw |>
+  filter(id <= total_esperado) |>   # por si un CSV viejo trae formas alternas
+  drop_na(name) |>                  # solo name: type_2 tiene NA legítimos
+  mutate(
+    # Sin niveles explícitos R ordenaría alfabéticamente (I, II, III, IV, IX, V...)
+    generation = factor(
+      generation,
+      levels = c("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX")
+    ),
+    # Una especie es evolución final si ninguna otra evoluciona desde ella
+    evolucion_final = !id %in% evoluciona_de
+  )
+
+kpi_total <- nrow(pokemon)
+
+# K-Means ----------------------------------------------------------------------
+
+stats_cols <- c("hp", "attack", "defense", "sp_atk", "sp_def", "speed")
+stats_nombres <- c("HP", "Ataque", "Defensa", "Atq. Esp.", "Def. Esp.", "Velocidad")
+
+# K-Means usa distancia euclidiana: sin escalar, las stats con más varianza
+# (HP llega a 255) pesarían más que las demás en la formación de los grupos.
+pokemon_stats <- pokemon |>
+  select(all_of(stats_cols)) |>
+  scale()
+
+# k = 4 se eligió por interpretabilidad (base, tanque, rápido, élite); no está
+# validado con codo ni silueta. nstart = 25 prueba 25 arranques aleatorios y se
+# queda con el mejor, para no depender de un mínimo local. La semilla fija los
+# resultados entre renderizados.
+set.seed(123)
+modelo_kmeans <- kmeans(pokemon_stats, centers = 4, nstart = 25)
+
+pokemon <- pokemon |>
+  mutate(cluster = as.factor(modelo_kmeans$cluster))
+
+# Nombres de los arquetipos ----------------------------------------------------
+
+# El número de cada clúster es arbitrario, así que el nombre se asigna por su
+# perfil. Así el nombre sigue siendo correcto aunque cambie la numeración.
+perfil_clusters <- pokemon |>
+  group_by(cluster) |>
+  summarise(
+    total_prom = mean(total),
+    speed_prom = mean(speed),
+    .groups = "drop"
+  )
+
+# Élite: mayor total promedio
+cl_elite <- perfil_clusters$cluster[which.max(perfil_clusters$total_prom)]
+restantes <- perfil_clusters |> filter(cluster != cl_elite)
+
+# Base: menor total promedio entre los que quedan
+cl_base <- restantes$cluster[which.min(restantes$total_prom)]
+restantes <- restantes |> filter(cluster != cl_base)
+
+# De los dos restantes, el más veloz es Rápidos y el otro Tanques
+cl_rapidos <- restantes$cluster[which.max(restantes$speed_prom)]
+restantes <- restantes |> filter(cluster != cl_rapidos)
+
+cl_tanques <- restantes$cluster
+
+# Niveles de menor a mayor fuerza y un color fijo por arquetipo, para que todas
+# las gráficas usen el mismo orden y los mismos colores.
+niveles_arquetipo <- c(
+  "Balanceados / Base",
+  "Tanques Lentos (Alta Def/HP)",
+  "Atacantes Rápidos de Cristal",
+  "Élite / Pseudolegendarios"
+)
+colores_arquetipo <- setNames(viridisLite::plasma(4, end = 0.9), niveles_arquetipo)
+
+pokemon <- pokemon |>
+  mutate(
+    arquetipo = case_when(
+      cluster == cl_elite   ~ "Élite / Pseudolegendarios",
+      cluster == cl_base    ~ "Balanceados / Base",
+      cluster == cl_rapidos ~ "Atacantes Rápidos de Cristal",
+      cluster == cl_tanques ~ "Tanques Lentos (Alta Def/HP)"
+    ),
+    arquetipo = factor(arquetipo, levels = niveles_arquetipo)
+  )
+
+# Tipos ------------------------------------------------------------------------
+
+# TRUE: cada Pokémon cuenta en sus dos tipos. Con solo el tipo principal, tipos
+# como Flying quedan con muy pocas observaciones (9) y sus promedios no son fiables.
+usar_tipo_secundario <- TRUE
+n_minimo <- 20  # por debajo de esto el tipo se marca con * como muestra pequeña
+
+# Formato largo: una fila por combinación Pokémon-tipo
+pokemon_tipos <- pokemon |>
+  select(total, all_of(stats_cols), arquetipo, type_1, type_2) |>
+  pivot_longer(cols = c(type_1, type_2), names_to = "posicion", values_to = "tipo") |>
+  filter(!is.na(tipo)) |>
+  mutate(posicion = if_else(posicion == "type_1", "Tipo principal", "Tipo secundario"))
+
+if (!usar_tipo_secundario) {
+  pokemon_tipos <- pokemon_tipos |> filter(posicion == "Tipo principal")
+}
+
+texto_tipos <- if (usar_tipo_secundario) "cuenta tipo principal y secundario" else "solo tipo principal"
+
+# Estilo -----------------------------------------------------------------------
+
+rojo_pk <- "#EE1515"
+azul_pk <- "#3B4CCA"
+gris <- "#6C757D"
+
+tema_dashboard <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 10.5, color = gris, margin = margin(b = 8)),
+    plot.title.position = "plot",
+    axis.title = element_text(size = 10.5, color = gris),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+# Barra de color más larga en los heatmaps; con la de ggplot por defecto las
+# etiquetas se enciman
+guia_heatmap <- guides(fill = guide_colorbar(barwidth = unit(7, "cm"), barheight = unit(0.4, "cm")))
+
+# Título y subtítulo para layout() de plotly: ggplotly no conserva el subtítulo
+# de ggplot. str_wrap evita que un título largo se corte en paneles angostos.
+titulo_plotly <- function(titulo, subtitulo = NULL, ancho = 65) {
+  texto <- paste0("<b>", str_replace_all(str_wrap(titulo, ancho), "\n", "<br>"), "</b>")
+  if (!is.null(subtitulo)) texto <- paste0(texto, "<br><sup>", subtitulo, "</sup>")
+  list(text = texto, x = 0.01, xanchor = "left", font = list(size = 14))
+}
+
+# Equipo equilibrado -----------------------------------------------------------
+
+# Legendarios y míticos quedan fuera porque tienen los totales más altos y
+# ocuparían todos los lugares. Las preevoluciones también, porque en un equipo
+# se usaría la forma final de la especie.
+incluir_legendarios <- FALSE
+solo_evoluciones_finales <- TRUE
+
+candidatos <- pokemon
+if (!incluir_legendarios) {
+  candidatos <- candidatos |> filter(!legendary, !mythical)
+}
+if (solo_evoluciones_finales) {
+  candidatos <- candidatos |> filter(evolucion_final)
+}
+
+equipo <- tibble()
+
+# Ronda 1: el de mayor total de cada arquetipo de combate, sin repetir tipo
+# principal. "Balanceados / Base" no tiene lugar reservado: casi todos sus
+# miembros son preevoluciones y su mejor opción siempre sería débil.
+arquetipos_rol <- c(
+  "Élite / Pseudolegendarios",
+  "Atacantes Rápidos de Cristal",
+  "Tanques Lentos (Alta Def/HP)"
+)
+
+for (arq in arquetipos_rol) {
+  elegido <- candidatos |>
+    filter(arquetipo == arq) |>
+    filter(!type_1 %in% equipo[["type_1"]]) |>  # [[ ]] porque equipo empieza sin columnas
+    slice_max(total, n = 1, with_ties = FALSE) |>
+    mutate(ronda = "Ronda 1: mejor de su arquetipo")
+  equipo <- bind_rows(equipo, elegido)
+}
+
+# Ronda 2: completar hasta 6 por total, sin repetir tipo principal
+lugares_restantes <- 6 - nrow(equipo)
+
+for (i in 1:lugares_restantes) {
+  elegido <- candidatos |>
+    filter(!id %in% equipo$id) |>
+    filter(!type_1 %in% equipo$type_1) |>
+    slice_max(total, n = 1, with_ties = FALSE) |>
+    mutate(ronda = "Ronda 2: relleno por total")
+  equipo <- bind_rows(equipo, elegido)
+}
+
+# Cifras y títulos del resumen -------------------------------------------------
+
+# Van en setup porque los usa más de un chunk (valueBox y gráfica de cada
+# pregunta). Los títulos se arman con los datos para que no queden desactualizados.
+
+# P1: tipos
+p1_tipos <- pokemon_tipos |>
+  group_by(tipo) |>
+  summarise(n = n(), total_prom = mean(total), .groups = "drop") |>
+  mutate(
+    muestra_pequena = n < n_minimo,
+    tipo_etiqueta = if_else(muestra_pequena, paste0(tipo, " *"), tipo)
+  ) |>
+  arrange(desc(total_prom))
+
+# Los extremos se eligen solo entre tipos con muestra suficiente
+p1_confiables <- p1_tipos |> filter(!muestra_pequena)
+p1_top    <- head(p1_confiables, 2)
+p1_bottom <- tail(p1_confiables, 2)
+titulo_p1 <- paste0(
+  p1_top$tipo[1], " y ", p1_top$tipo[2], " son los tipos más fuertes; ",
+  p1_bottom$tipo[1], " y ", p1_bottom$tipo[2], ", los más débiles"
+)
+
+# P2: generaciones
+gens_antiguas  <- c("I", "II", "III")
+gens_recientes <- c("VII", "VIII", "IX")
+
+p2_gen <- pokemon |>
+  group_by(generation) |>
+  summarise(
+    n = n(),
+    mediana = median(total),
+    mediana_final = median(total[evolucion_final]),
+    .groups = "drop"
+  )
+
+# Se usa la mediana y no el promedio porque los legendarios inflan el promedio
+p2_antes   <- median(pokemon$total[pokemon$generation %in% gens_antiguas])
+p2_despues <- median(pokemon$total[pokemon$generation %in% gens_recientes])
+p2_antes_final   <- median(pokemon$total[pokemon$generation %in% gens_antiguas & pokemon$evolucion_final])
+p2_despues_final <- median(pokemon$total[pokemon$generation %in% gens_recientes & pokemon$evolucion_final])
+titulo_p2 <- paste0(
+  "Las generaciones recientes son más fuertes: la mediana sube de ",
+  p2_antes, " pts (I–III) a ", p2_despues, " pts (VII–IX)"
+)
+
+# P3: tipo x arquetipo. "dominante" es el % del arquetipo más común en cada tipo
+p3_tipo_arq <- pokemon_tipos |>
+  count(tipo, arquetipo, name = "cantidad") |>
+  group_by(tipo) |>
+  mutate(
+    n_tipo = sum(cantidad),
+    porcentaje = cantidad / n_tipo,
+    dominante = max(porcentaje)
+  ) |>
+  ungroup()
+
+p3_resumen <- p3_tipo_arq |> distinct(tipo, dominante)
+p3_mezclados <- sum(p3_resumen$dominante <= 0.5)
+p3_total_tipos <- nrow(p3_resumen)
+titulo_p3 <- paste0(
+  "Los arquetipos no copian a los tipos: en ", p3_mezclados, " de ", p3_total_tipos,
+  " tipos, ningún arquetipo reúne más de la mitad"
+)
+
+# El % de evoluciones finales muestra que "Base" es en la práctica el grupo de preevoluciones
+resumen_arquetipos <- pokemon |>
+  group_by(arquetipo) |>
+  summarise(
+    n = n(),
+    total_prom = mean(total),
+    pct_final = mean(evolucion_final),
+    .groups = "drop"
+  )
+pct_final_base <- resumen_arquetipos$pct_final[resumen_arquetipos$arquetipo == "Balanceados / Base"]
+
+# P4: equipo
+p4_equipo_prom <- round(mean(equipo$total))
+texto_candidatos <- paste0(
+  "6 tipos principales distintos",
+  if (!incluir_legendarios) ", sin legendarios" else "",
+  if (solo_evoluciones_finales) ", sin preevoluciones" else ""
+)
+p4_candidato_med <- median(candidatos$total)
+titulo_p4 <- paste0(
+  "El equipo propuesto promedia ", p4_equipo_prom, " pts, ",
+  p4_equipo_prom - p4_candidato_med, " más que el candidato típico (",
+  p4_candidato_med, " pts)"
+)
+
+# Tarjetas de stats (Explorador de Datos) --------------------------------------
+
+stats_tarjetas <- tibble(
+  columna  = c("hp", "attack", "defense", "speed", "sp_atk", "sp_def"),
+  etiqueta = c("HP", "Ataque", "Defensa", "Velocidad", "Ataque Esp.", "Defensa Esp.")
+) |>
+  mutate(
+    promedio = map_dbl(columna, \(col) mean(pokemon[[col]])),
+    maximo   = map_dbl(columna, \(col) max(pokemon[[col]])),
+    minimo   = map_dbl(columna, \(col) min(pokemon[[col]])),
+    # En empates se queda el primero por ID
+    poke_max = map_chr(columna, \(col) pokemon$name[which.max(pokemon[[col]])]),
+    poke_min = map_chr(columna, \(col) pokemon$name[which.min(pokemon[[col]])])
+  )
+
+# Una tarjeta HTML por stat; los estilos están en el chunk de CSS
+tarjeta_stat <- function(etiqueta, promedio, maximo, minimo, poke_max, poke_min) {
+  htmltools::div(
+    class = "stat-card",
+    htmltools::div(class = "stat-titulo", paste("Prom.", etiqueta)),
+    htmltools::div(
+      class = "stat-cuerpo",
+      htmltools::span(class = "stat-valor",
+                      number(promedio, accuracy = 0.01, decimal.mark = ",")),
+      htmltools::div(
+        class = "stat-rango",
+        htmltools::span(class = "stat-max", title = paste("Máximo:", poke_max),
+                        paste("\u25B2", maximo)),
+        htmltools::span(class = "stat-min", title = paste("Mínimo:", poke_min),
+                        paste("\u25BC", minimo))
+      )
+    ),
+    htmltools::div(class = "stat-pie",
+                   paste0("Máx: ", poke_max, " · Mín: ", poke_min))
+  )
+}
+```
+
+```{css}
+/* Tarjetas de promedio de stats (Explorador de Datos) */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  padding: 6px 4px;
+}
+.stat-card {
+  border: 1px solid #dee2e6;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.stat-titulo { font-size: 13px; font-weight: 600; color: #6C757D; }
+.stat-cuerpo { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+.stat-valor  { font-size: 30px; font-weight: 700; line-height: 1.1; }
+.stat-rango  { display: flex; flex-direction: column; text-align: right; font-size: 13px; font-weight: 600; }
+.stat-max    { color: #28a745; }
+.stat-min    { color: #dc3545; }
+.stat-pie    { font-size: 11px; color: #6C757D; margin-top: 6px; }
+.stats-leyenda { font-size: 12px; color: #6C757D; padding: 2px 6px; }
+.stats-leyenda .stat-max, .stats-leyenda .stat-min { margin-right: 12px; }
+
+/* Permite que los captions largos de los valueBox usen dos líneas */
+.value-box .caption { white-space: normal; line-height: 1.25; }
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Resumen de Hallazgos
+===============================
+
+Row
+-------------------------------
+
+### P1 · Tipos
+
+```{r}
+valueBox(
+  value = p1_top$tipo[1],
+  caption = paste0("P1 · Tipo más fuerte: ", round(p1_top$total_prom[1]), " pts de total promedio"),
+  icon = "fa-fire",
+  color = "primary"
+)
+```
+
+### P2 · Generaciones
+
+```{r}
+valueBox(
+  value = paste0("+", p2_despues - p2_antes, " pts"),
+  caption = "P2 · Mediana de stats: Gen VII–IX vs Gen I–III",
+  icon = "fa-signal",
+  color = "info"
+)
+```
+
+### P3 · Arquetipos
+
+```{r}
+valueBox(
+  value = paste(p3_mezclados, "de", p3_total_tipos),
+  caption = "P3 · Tipos repartidos entre arquetipos (ninguno supera el 50%)",
+  icon = "fa-random",
+  color = "warning"
+)
+```
+
+### P4 · Equipo
+
+```{r}
+valueBox(
+  value = paste(p4_equipo_prom, "pts"),
+  caption = paste0("P4 · Total promedio del equipo (candidato típico: ", p4_candidato_med, ")"),
+  icon = "fa-users",
+  color = "success"
+)
+```
+
+Row {data-height=470}
+-------------------------------
+
+### P1 · ¿Qué distingue a los tipos?
+
+```{r}
+# Lollipop del total promedio por tipo. Los segmentos arrancan un poco antes del
+# mínimo para no desperdiciar el eje desde cero.
+x_inicio <- floor(min(p1_tipos$total_prom) / 10) * 10 - 10
+
+g_p1 <- ggplot(p1_tipos, aes(y = reorder(tipo_etiqueta, total_prom))) +
+  geom_vline(xintercept = mean(pokemon$total), linetype = "dashed", color = gris) +
+  geom_segment(aes(x = x_inicio, xend = total_prom, yend = reorder(tipo_etiqueta, total_prom)),
+               color = "grey80") +
+  geom_point(
+    aes(x = total_prom, color = muestra_pequena,
+        text = paste0(tipo, "<br>Total promedio: ", round(total_prom), "<br>n = ", n)),
+    size = 3
+  ) +
+  scale_color_manual(values = c("FALSE" = rojo_pk, "TRUE" = gris)) +  # gris = muestra pequeña
+  labs(x = "Total de stats (promedio)", y = NULL) +
+  tema_dashboard +
+  theme(legend.position = "none")
+
+ggplotly(g_p1, tooltip = "text") |>
+  layout(
+    title = titulo_plotly(
+      titulo_p1,
+      paste0("Total promedio por tipo (", texto_tipos, "). Línea punteada = promedio general")
+    ),
+    margin = list(t = 80)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+### P2 · ¿Qué generaciones son diferentes?
+
+```{r}
+# Mediana por generación, con dos segmentos de referencia para los bloques I–III y VII–IX
+referencias_p2 <- tibble(
+  x = c(1, 7), xend = c(3, 9),  # posiciones en el eje numérico (I = 1 ... IX = 9)
+  y = c(p2_antes, p2_despues),
+  etiqueta = c("Mediana I–III", "Mediana VII–IX")
+)
+
+# El eje es numérico para poder dibujar los segmentos; las etiquetas se ponen a mano
+g_p2 <- ggplot(p2_gen, aes(x = as.numeric(generation), y = mediana)) +
+  geom_segment(
+    data = referencias_p2,
+    aes(x = x, xend = xend, y = y, yend = y, text = paste0(etiqueta, ": ", y)),
+    linetype = "dashed", color = azul_pk, linewidth = 0.8
+  ) +
+  geom_line(color = rojo_pk, linewidth = 1) +
+  geom_point(
+    aes(text = paste0("Generación ", generation, "<br>Mediana: ", mediana, "<br>n = ", n)),
+    color = rojo_pk, size = 3
+  ) +
+  scale_x_continuous(breaks = 1:9, labels = levels(pokemon$generation)) +
+  labs(x = "Generación", y = "Mediana de stats totales") +
+  tema_dashboard
+
+ggplotly(g_p2, tooltip = "text") |>
+  layout(
+    title = titulo_plotly(titulo_p2, "Punto rojo = mediana de cada generación. Líneas azules = mediana de cada bloque"),
+    margin = list(t = 80)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+Row {data-height=520}
+-------------------------------
+
+### P3 · ¿Los arquetipos corresponden a los tipos?
+
+```{r}
+# Barras al 100%: reparto de cada tipo entre los 4 arquetipos.
+# Arriba quedan los tipos más repartidos (menor % dominante).
+orden_p3 <- p3_resumen |> arrange(desc(dominante)) |> pull(tipo)
+
+g_p3 <- ggplot(
+  p3_tipo_arq,
+  aes(
+    x = porcentaje,
+    y = factor(tipo, levels = orden_p3),
+    fill = arquetipo,
+    text = paste0(tipo, " (n=", n_tipo, ")<br>", arquetipo, ": ", percent(porcentaje, accuracy = 1))
+  )
+) +
+  geom_col(width = 0.75) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "white", linewidth = 0.8) +
+  scale_x_continuous(labels = percent) +
+  scale_fill_manual(values = colores_arquetipo) +
+  labs(x = "% de los Pokémon del tipo", y = NULL, fill = NULL) +
+  tema_dashboard
+
+ggplotly(g_p3, tooltip = "text") |>
+  layout(
+    title = titulo_plotly(titulo_p3, "Cada barra suma 100%. Línea blanca = 50%"),
+    legend = list(orientation = "h", x = 0, y = -0.25),  # abajo; a la derecha se cortaban los nombres
+    margin = list(t = 80)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+### P4 · ¿Cómo armar un equipo equilibrado?
+
+```{r}
+# Total de cada integrante contra la mediana de los candidatos
+g_p4 <- ggplot(
+  equipo,
+  aes(
+    x = total,
+    y = reorder(name, total),
+    fill = arquetipo,
+    text = paste0(name, " (", type_1, ")<br>", arquetipo, "<br>Total: ", total, "<br>", ronda)
+  )
+) +
+  geom_col(width = 0.6) +
+  geom_vline(xintercept = p4_candidato_med, linetype = "dashed", color = gris) +
+  scale_fill_manual(values = colores_arquetipo) +
+  labs(x = "Total de stats", y = NULL, fill = NULL) +
+  tema_dashboard
+
+ggplotly(g_p4, tooltip = "text") |>
+  layout(
+    title = titulo_plotly(
+      titulo_p4,
+      paste0(texto_candidatos, ". Línea punteada = candidato típico")
+    ),
+    legend = list(orientation = "h", x = 0, y = -0.2),
+    margin = list(t = 80)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+P1 · Tipos
+===============================
+
+Row
+-------------------------------
+
+### Cómo leer esta página
+
+> **Pregunta 1: ¿Qué características distinguen a los distintos tipos?** El heatmap muestra el promedio de cada estadística por tipo (`r texto_tipos`). Un color más intenso indica un promedio más alto. El número entre paréntesis es cuántos Pokémon hay de ese tipo, y el asterisco (*) marca los tipos con menos de `r n_minimo`: esos promedios pueden cambiar mucho con un solo Pokémon. La gráfica de abajo muestra por qué conviene contar también el tipo secundario: algunos tipos, como Flying, aparecen casi siempre en segundo lugar.
+
+Row {data-height=780}
+-------------------------------
+
+### Perfil estadístico por tipo
+
+```{r, fig.width=9, fig.height=8}
+promedio_tipo <- pokemon_tipos |>
+  group_by(tipo) |>
+  summarise(
+    n = n(),
+    across(all_of(stats_cols), mean),
+    total_prom = mean(total),  # solo para ordenar las filas
+    .groups = "drop"
+  ) |>
+  mutate(tipo_etiqueta = paste0(tipo, " (n=", n, ")", if_else(n < n_minimo, " *", "")))
+
+heatmap_tipo <- promedio_tipo |>
+  pivot_longer(cols = all_of(stats_cols), names_to = "estadistica", values_to = "promedio") |>
+  mutate(estadistica = factor(estadistica, levels = stats_cols, labels = stats_nombres))
+
+# El título nombra al tipo líder de cada stat, excluyendo tipos con muestra pequeña
+lideres <- heatmap_tipo |>
+  filter(n >= n_minimo) |>
+  group_by(estadistica) |>
+  slice_max(promedio, n = 1, with_ties = FALSE) |>
+  ungroup()
+titulo_heatmap <- paste0(
+  "Cada tipo tiene su especialidad: ",
+  paste(lideres$tipo, "lidera", lideres$estadistica, collapse = "; ")
+)
+
+ggplot(heatmap_tipo, aes(x = estadistica, y = reorder(tipo_etiqueta, total_prom), fill = promedio)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(promedio)), size = 3.4) +
+  scale_fill_gradient(low = "white", high = rojo_pk, breaks = breaks_pretty(n = 4)) +
+  guia_heatmap +
+  labs(
+    title = str_wrap(titulo_heatmap, 80),
+    subtitle = paste0("Promedio de cada stat por tipo (", texto_tipos, "). Ordenado por total promedio"),
+    x = NULL, y = NULL, fill = "Promedio"
+  ) +
+  tema_dashboard +
+  theme(panel.grid = element_blank())
+```
+
+Row {data-height=520}
+-------------------------------
+
+### ¿Cuántos Pokémon hay de cada tipo?
+
+```{r, fig.width=10, fig.height=5}
+# Separa tipo principal y secundario para mostrar por qué se cuentan ambos
+conteo_tipos <- pokemon_tipos |>
+  count(tipo, posicion, name = "cantidad") |>
+  group_by(tipo) |>
+  mutate(total_tipo = sum(cantidad)) |>
+  ungroup()
+
+ggplot(conteo_tipos, aes(x = cantidad, y = reorder(tipo, total_tipo), fill = posicion)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = n_minimo, linetype = "dashed", color = gris) +
+  scale_fill_manual(values = c("Tipo principal" = azul_pk, "Tipo secundario" = "#9BA5E8")) +
+  labs(
+    title = "Flying casi nunca es tipo principal, pero es de los más comunes como secundario",
+    subtitle = paste0("Cantidad de Pokémon por tipo. Línea punteada = umbral de muestra pequeña (", n_minimo, ")"),
+    x = "Cantidad de Pokémon", y = NULL, fill = NULL
+  ) +
+  tema_dashboard
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+P2 · Generaciones
+===============================
+
+Row
+-------------------------------
+
+### Cómo leer esta página
+
+> **Pregunta 2: ¿Qué generaciones presentan diferencias relevantes?** La gráfica de caja compara las stats totales de cada generación; cada punto es un Pokémon. Ojo: parte de la diferencia viene de **qué tipo de Pokémon** trae cada generación. Las generaciones antiguas tienen más preevoluciones (formas débiles). Si comparamos solo evoluciones finales, la mediana pasa de `r p2_antes_final` (I–III) a `r p2_despues_final` (VII–IX): la diferencia se reduce de `r p2_despues - p2_antes` a `r p2_despues_final - p2_antes_final` puntos, pero no desaparece.
+
+Row {data-height=500}
+-------------------------------
+
+### Stats totales por generación {data-width=600}
+
+```{r}
+# outlier.shape = NA porque los puntos del jitter ya muestran todos los valores
+g_generacion <- ggplot(pokemon, aes(x = generation, y = total)) +
+  geom_boxplot(aes(fill = generation), alpha = 0.4, outlier.shape = NA, width = 0.5) +
+  geom_jitter(
+    aes(text = paste("Nombre:", name, "<br>Tipo:", type_1, "<br>Total:", total)),
+    width = 0.15, alpha = 0.5, size = 1.5, color = gris
+  ) +
+  scale_fill_brewer(palette = "Set1") +  # Set1 tiene 9 colores, uno por generación
+  labs(x = "Generación", y = "Total de Stats") +
+  tema_dashboard +
+  theme(legend.position = "none")
+
+ggplotly(g_generacion, tooltip = "text") |>
+  layout(
+    title = titulo_plotly(
+      paste0(
+        "Las generaciones con mayor mediana son: ",
+        paste("Gen", head(arrange(p2_gen, desc(mediana))$generation, 3), collapse = ", ")
+      ),
+      "La caja muestra el 50% central y la línea la mediana; cada punto es un Pokémon"
+    ),
+    margin = list(t = 70)
+  )
+```
+
+### ¿La diferencia es solo por las preevoluciones? {data-width=400}
+
+```{r}
+# Misma mediana por generación, con y sin preevoluciones
+p2_largo <- p2_gen |>
+  pivot_longer(cols = c(mediana, mediana_final), names_to = "grupo", values_to = "valor") |>
+  mutate(grupo = if_else(grupo == "mediana", "Todos los Pokémon", "Solo evoluciones finales"))
+
+g_p2_final <- ggplot(p2_largo, aes(x = as.numeric(generation), y = valor, color = grupo)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(text = paste0("Gen ", generation, "<br>", grupo, ": ", valor)), size = 2.5) +
+  scale_x_continuous(breaks = 1:9, labels = levels(pokemon$generation)) +
+  scale_color_manual(values = c("Todos los Pokémon" = rojo_pk, "Solo evoluciones finales" = azul_pk)) +
+  labs(x = "Generación", y = "Mediana de stats totales", color = NULL) +
+  tema_dashboard
+
+ggplotly(g_p2_final, tooltip = "text") |>
+  layout(
+    title = titulo_plotly("Con solo evoluciones finales la brecha se reduce", NULL, ancho = 40),
+    legend = list(orientation = "h", x = 0, y = -0.2),
+    margin = list(t = 50)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+Row {data-height=470}
+-------------------------------
+
+### Pokémon por generación {data-width=400}
+
+```{r}
+plot_ly(
+  p2_gen,
+  x = ~generation,
+  y = ~n,
+  type = "bar",
+  marker = list(color = rojo_pk),
+  text = ~n,
+  textposition = "outside",
+  hovertemplate = "Generación %{x}<br>%{y} Pokémon<extra></extra>"
+) |>
+  layout(
+    xaxis = list(title = "Generación"),
+    yaxis = list(title = "Cantidad de Pokémon", range = c(0, max(p2_gen$n) * 1.15)),  # espacio para las etiquetas
+    margin = list(t = 20)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+### Resumen por generación {data-width=600}
+
+```{r}
+resumen_generacion <- pokemon |>
+  group_by(generation) |>
+  summarise(
+    Pokémon = n(),
+    `Mediana Total` = median(total),
+    `Mediana (solo evol. finales)` = median(total[evolucion_final]),
+    `% evol. finales` = percent(mean(evolucion_final), accuracy = 1),
+    `Legendarios + Míticos` = sum(legendary | mythical),
+    .groups = "drop"
+  ) |>
+  rename(Generación = generation)
+
+DT::datatable(resumen_generacion, rownames = FALSE, options = list(dom = "t"))
+```
+
+Row {data-height=500}
+-------------------------------
+
+### Legendarios: promedio de stats por generación
+
+```{r, fig.width=9, fig.height=5}
+# n va en la etiqueta porque hay generaciones con muy pocos legendarios
+leg_gen <- pokemon |>
+  filter(legendary) |>
+  group_by(generation) |>
+  summarise(n = n(), across(all_of(stats_cols), mean), .groups = "drop") |>
+  mutate(gen_etiqueta = fct_inorder(paste0("Gen ", generation, " (n=", n, ")")))
+
+leg_gen_largo <- leg_gen |>
+  pivot_longer(cols = all_of(stats_cols), names_to = "estadistica", values_to = "promedio") |>
+  mutate(estadistica = factor(estadistica, levels = stats_cols, labels = stats_nombres))
+
+ggplot(leg_gen_largo, aes(x = estadistica, y = fct_rev(gen_etiqueta), fill = promedio)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(promedio)), size = 3.5) +
+  scale_fill_gradient(low = "white", high = rojo_pk, breaks = breaks_pretty(n = 4)) +
+  guia_heatmap +
+  labs(
+    title = "Legendarios: promedio de stats por generación",
+    subtitle = "Solo legendarios (sin míticos). Entre paréntesis, cuántos hay: con n pequeña, un Pokémon mueve mucho el promedio",
+    x = NULL, y = NULL, fill = "Promedio"
+  ) +
+  tema_dashboard +
+  theme(panel.grid = element_blank())
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+P3 · Arquetipos
+===============================
+
+Row
+-------------------------------
+
+### Lectura analítica del modelo
+
+> **Pregunta 3: ¿Existen arquetipos que no correspondan exactamente con sus tipos?** Agrupar Pokémon por su tipo ignora sus capacidades de combate. Usamos **K-Means** sobre las 6 estadísticas base escaladas para descubrir 4 arquetipos. Hallazgo importante: el arquetipo **"Balanceados / Base"** es, en la práctica, el grupo de las preevoluciones (solo el `r percent(pct_final_base, accuracy = 1)` de sus miembros es evolución final). Es decir, el modelo separa también **etapas evolutivas**, no solo estilos de combate. La tabla Tipo × Arquetipo al final muestra cómo cada tipo se reparte entre los 4 grupos.
+
+Row {data-height=420}
+-------------------------------
+
+### ¿Cuántos Pokémon hay en cada arquetipo? {data-width=500}
+
+```{r}
+# sort = FALSE respeta el orden de niveles_arquetipo, así cada rebanada conserva su color
+plot_ly(
+  resumen_arquetipos,
+  labels = ~arquetipo,
+  values = ~n,
+  type = "pie",
+  hole = 0.55,
+  sort = FALSE,
+  marker = list(
+    colors = unname(colores_arquetipo[as.character(resumen_arquetipos$arquetipo)]),
+    line = list(color = "#FFFFFF", width = 2)
+  ),
+  textinfo = "percent",
+  hovertemplate = "%{label}<br>%{value} Pokémon (%{percent})<extra></extra>"
+) |>
+  layout(
+    showlegend = TRUE,
+    legend = list(orientation = "h", x = 0, y = -0.1),  # abajo; a la derecha se cortaban los nombres
+    annotations = list(list(
+      text = paste0("<b>", kpi_total, "</b><br>Pokémon"),
+      showarrow = FALSE, font = list(size = 16)
+    )),
+    margin = list(t = 20, b = 20)
+  ) |>
+  plotly::config(displayModeBar = FALSE)
+```
+
+### Resumen por arquetipo {data-width=500}
+
+```{r}
+DT::datatable(
+  resumen_arquetipos |>
+    mutate(total_prom = round(total_prom), pct_final = percent(pct_final, accuracy = 1)) |>
+    rename(Arquetipo = arquetipo, Pokémon = n, `Total promedio` = total_prom,
+           `% evoluciones finales` = pct_final),
+  rownames = FALSE,
+  options = list(dom = "t")
+)
+```
+
+Row {data-height=500}
+-------------------------------
+
+### Perfil de cada arquetipo {data-width=500}
+
+```{r, fig.width=7, fig.height=5}
+# Promedio de cada stat por arquetipo (en escala original, no la escalada del modelo)
+resumen_cluster <- pokemon |>
+  group_by(arquetipo) |>
+  summarise(across(all_of(stats_cols), mean), .groups = "drop") |>
+  pivot_longer(cols = all_of(stats_cols), names_to = "estadistica", values_to = "valor") |>
+  mutate(estadistica = factor(estadistica, levels = stats_cols, labels = stats_nombres))
+
+# Los nombres de los arquetipos se parten en dos líneas para que la leyenda no se corte
+ggplot(resumen_cluster, aes(x = estadistica, y = valor, fill = arquetipo)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = colores_arquetipo, labels = \(x) str_wrap(x, 16)) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(
+    title = "Cada arquetipo tiene un perfil distinto",
+    subtitle = "Promedio de las 6 stats por arquetipo",
+    x = NULL, y = "Valor promedio", fill = NULL
+  ) +
+  tema_dashboard
+```
+
+### Velocidad vs Ataque por arquetipo {data-width=500}
+
+```{r}
+g_cluster <- ggplot(
+  pokemon,
+  aes(
+    x = speed, y = attack, color = arquetipo,
+    text = paste("Nombre:", name, "<br>Tipo:", type_1, "<br>Total:", total, "<br>", arquetipo)
+  )
+) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = colores_arquetipo) +
+  labs(x = "Velocidad base", y = "Ataque base", color = NULL) +
+  tema_dashboard
+
+ggplotly(g_cluster, tooltip = "text") |>
+  layout(legend = list(orientation = "h", x = 0, y = -0.2))
+```
+
+Row {data-height=780}
+-------------------------------
+
+### Tipo × Arquetipo (% dentro de cada tipo)
+
+```{r, fig.width=9, fig.height=8}
+ggplot(
+  p3_tipo_arq |> mutate(tipo_etiqueta = paste0(tipo, " (n=", n_tipo, ")")),
+  aes(x = arquetipo, y = reorder(tipo_etiqueta, n_tipo), fill = porcentaje * 100)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(porcentaje * 100), "%")), size = 3.2, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = azul_pk, breaks = breaks_pretty(n = 4)) +
+  scale_x_discrete(labels = \(x) str_wrap(x, width = 15)) +
+  guia_heatmap +
+  labs(
+    title = "Porcentaje de cada tipo que cae en cada arquetipo",
+    subtitle = paste0("Cada renglón suma 100% (", texto_tipos, "). Casilla vacía = ningún Pokémon"),
+    x = NULL, y = NULL, fill = "% del tipo"
+  ) +
+  tema_dashboard +
+  theme(panel.grid = element_blank())
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+P4 · Equipo
+===============================
+
+Row
+-------------------------------
+
+### Regla para armar el equipo
+
+> **Pregunta 4: ¿Cómo podría construirse un equipo equilibrado?** **Candidatos:** solo evoluciones finales y sin legendarios ni míticos (ambos se pueden cambiar con `solo_evoluciones_finales` e `incluir_legendarios`). **Ronda 1:** entra el Pokémon de mayor total de cada arquetipo de combate: Élite, Atacantes Rápidos y Tanques. "Balanceados / Base" ya no tiene lugar reservado porque es, en la práctica, el grupo de las preevoluciones (ver pestaña P3); con la regla anterior su "mejor" era Crocalor, con 411 puntos. **Ronda 2:** los lugares restantes se llenan con los de mayor total. **En ambas rondas** no se repite tipo principal.
+
+Row
+-------------------------------
+
+### Poder del equipo
+
+```{r}
+valueBox(
+  value = comma(sum(equipo$total)),
+  caption = "Suma de stats totales del equipo",
+  icon = "fa-bolt",
+  color = "primary"
+)
+```
+
+### Tipos distintos
+
+```{r}
+valueBox(
+  value = n_distinct(equipo$type_1),
+  caption = "Tipos principales distintos en el equipo",
+  icon = "fa-leaf",
+  color = "info"
+)
+```
+
+### Roles cubiertos
+
+```{r}
+valueBox(
+  value = paste(sum(arquetipos_rol %in% equipo$arquetipo), "de", length(arquetipos_rol)),
+  caption = "Arquetipos de combate representados",
+  icon = "fa-users",
+  color = "warning"
+)
+```
+
+Row {data-height=450}
+-------------------------------
+
+### Integrantes del equipo {data-width=550}
+
+```{r}
+tabla_equipo <- equipo |>
+  select(
+    Nombre = name,
+    `Tipo Principal` = type_1,
+    `Tipo Secundario` = type_2,
+    Arquetipo = arquetipo,
+    `Total Stats` = total,
+    `¿Por qué entró?` = ronda
+  )
+
+DT::datatable(tabla_equipo, rownames = FALSE, options = list(dom = "t"))
+```
+
+### Equipo vs todos los candidatos {data-width=450}
+
+```{r, fig.width=7, fig.height=5}
+prom_equipo <- equipo |>
+  summarise(across(all_of(stats_cols), mean)) |>
+  mutate(grupo = "Equipo")
+
+prom_candidatos <- candidatos |>
+  summarise(across(all_of(stats_cols), mean)) |>
+  mutate(grupo = "Todos los candidatos")
+
+comparacion_equipo <- bind_rows(prom_equipo, prom_candidatos) |>
+  pivot_longer(cols = all_of(stats_cols), names_to = "estadistica", values_to = "promedio") |>
+  mutate(estadistica = factor(estadistica, levels = stats_cols, labels = stats_nombres))
+
+# El título menciona las stats donde el equipo queda por debajo, si las hay
+diferencias <- comparacion_equipo |>
+  pivot_wider(names_from = grupo, values_from = promedio) |>
+  mutate(gana_equipo = Equipo > `Todos los candidatos`)
+stats_debajo <- as.character(diferencias$estadistica[!diferencias$gana_equipo])
+
+titulo_equipo <- if (length(stats_debajo) == 0) {
+  "El equipo supera al candidato promedio en todas las stats"
+} else {
+  paste0("El equipo supera al candidato promedio en ", sum(diferencias$gana_equipo),
+         " de 6 stats; su punto débil: ", paste(stats_debajo, collapse = ", "))
+}
+
+ggplot(comparacion_equipo, aes(x = estadistica, y = promedio, fill = grupo)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = c("Equipo" = azul_pk, "Todos los candidatos" = gris)) +
+  labs(
+    title = str_wrap(titulo_equipo, 55),
+    subtitle = "Promedio de cada stat: equipo (azul) vs todos los candidatos (gris)",
+    x = NULL, y = "Valor promedio", fill = NULL
+  ) +
+  tema_dashboard
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Explorador de Datos
+===============================
+
+Row
+-------------------------------
+
+### Uso de esta página
+
+> **Herramienta de validación.** Aquí puedes buscar y filtrar cualquier Pokémon para ver a qué arquetipo lo asignó el modelo y si es evolución final. Las tarjetas dan el panorama general de las 6 stats en las `r comma(kpi_total)` especies.
+
+Row {data-height=190}
+-------------------------------
+
+### Promedio de las estadísticas base
+
+```{r}
+tarjetas <- stats_tarjetas |>
+  select(etiqueta, promedio, maximo, minimo, poke_max, poke_min) |>
+  pmap(tarjeta_stat)
+
+htmltools::tagList(
+  htmltools::div(class = "stats-grid", tarjetas),
+  htmltools::div(
+    class = "stats-leyenda",
+    htmltools::span(class = "stat-max", "\u25B2 Máximo"),
+    htmltools::span(class = "stat-min", "\u25BC Mínimo"),
+    "Pasa el cursor sobre el máximo o mínimo para ver qué Pokémon lo tiene"
+  )
+)
+```
+
+Row
+-------------------------------
+
+### Base de datos completa
+
+```{r}
+tabla_final <- pokemon |>
+  select(
+    ID = id,
+    Nombre = name,
+    Generación = generation,
+    `Tipo Principal` = type_1,
+    `Tipo Secundario` = type_2,
+    `Total Stats` = total,
+    Ataque = attack,
+    Defensa = defense,
+    Velocidad = speed,
+    `¿Evol. final?` = evolucion_final,
+    Arquetipo = arquetipo
+  )
+
+DT::datatable(
+  tabla_final,
+  rownames = FALSE,
+  filter = "top",
+  options = list(
+    autoWidth = TRUE,
+    language = list(
+      search = "Buscar:",
+      info = "Mostrando _START_ a _END_ de _TOTAL_",
+      paginate = list(previous = "Anterior", `next` = "Siguiente")
+    )
+  )
+)
+```
